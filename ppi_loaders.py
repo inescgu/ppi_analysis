@@ -38,11 +38,6 @@ def load_ppi_network(ppi_source):
         "HuRI": load_huri,
         "Bioplex": load_bioplex,
         "Biogrid": load_biogrid,
-        "HAPPI": load_happi,
-        "DICS": load_dics,
-        "IntNetDB": load_intnetdb,
-        "ImitateDB": load_imitatedb,
-        "DLIP": load_dlip,
         "Test": create_test_ppi_network
     }
     
@@ -250,15 +245,14 @@ def load_hippie():
             if df.shape[1] < 15:
                 print(f"HIPPIE data has insufficient columns: {df.shape[1]}")
                 return create_test_ppi_network("HIPPIE")
-            
-            # Extract required columns
+                        # Extract required columns
             df = df.iloc[:, [0, 1, 2, 3, 14]]
             df.columns = ['id_a', 'id_b', 'alt_id_a', 'alt_id_b', 'confidence']
             
         except Exception as e:
             print(f"Error reading HIPPIE data: {str(e)}")
             return create_test_ppi_network("HIPPIE")
-        
+
         # Extract gene symbols from alternative IDs
         def extract_gene_symbol(alt_id):
             if not isinstance(alt_id, str):
@@ -267,18 +261,18 @@ def load_hippie():
             try:
                 for item in alt_id.split('|'):
                     # Look for gene name in parentheses
-                    if 'uniprotkb:' in item and '(' in item and ')' in item:
-                        start = item.find('(') + 1
-                        end = item.find(')', start)
+                    if 'uniprotkb:' in item and ':' in item and '_' in item:
+                        start = item.find(':') + 1
+                        end = item.find('_', start)
                         if start > 0 and end > start:
                             return item[start:end]
             except:
                 return None
             return None
-        
+       
         df['gene_a'] = df['alt_id_a'].apply(extract_gene_symbol)
         df['gene_b'] = df['alt_id_b'].apply(extract_gene_symbol)
-        
+
         # Filter interactions with confidence score >= 0.63 (medium confidence)
         try:
             df['confidence'] = pd.to_numeric(df['confidence'], errors='coerce')
@@ -289,7 +283,7 @@ def load_hippie():
         
         # Filter out interactions where gene symbols couldn't be extracted
         df = df.dropna(subset=['gene_a', 'gene_b'])
-        
+
         # Create a graph
         G = nx.Graph()
         
@@ -301,12 +295,13 @@ def load_hippie():
             except:
                 # Skip problematic edges
                 continue
+
         
         # Create a mapping of gene symbols to node IDs (in this case, they're the same)
         gene_map = {gene: gene for gene in G.nodes()}
-        
+
         print(f"HIPPIE network loaded with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
-        
+
         return G, gene_map
     
     finally:
@@ -317,7 +312,8 @@ def load_hippie():
 def load_intact():
     """
     Load the IntAct PPI network (filtered for human interactions)
-    
+    Memory-efficient version for large datasets
+
     Returns:
     --------
     networkx.Graph
@@ -374,102 +370,169 @@ def load_intact():
         except:
             print("Could not read IntAct header")
         
-        # Read the file with pandas
-        try:
-            # Use column names if found, otherwise use numeric indices
-            if column_names:
-                df = pd.read_csv(intact_file, sep='\t', names=column_names, comment='#', skiprows=1, low_memory=False)
-            else:
-                df = pd.read_csv(intact_file, sep='\t', comment='#', low_memory=False)
+        # Identify key column indices
+        taxid_col_indices = []
+        alias_col_indices = []
+        confidence_col_index = None
+        
+        if column_names:
+            for i, col in enumerate(column_names):
+                col_lower = col.lower()
+                if 'taxid' in col_lower and 'interactor' in col_lower:
+                    taxid_col_indices.append(i)
+                elif 'alias' in col_lower and 'interactor' in col_lower:
+                    alias_col_indices.append(i)
+                elif 'confidence' in col_lower and 'value' in col_lower:
+                    confidence_col_index = i
+        
+        # Check if we found the necessary columns
+        if len(taxid_col_indices) < 2 or len(alias_col_indices) < 2:
+            print(f"Could not identify required columns in IntAct data. Using test network instead.")
+            return create_test_ppi_network("IntACT")
+        
+        # Create a graph
+        G = nx.Graph()
+    
             
-            # Look for taxid columns to filter for human interactions
-            taxid_cols = []
-            for i, col in enumerate(df.columns):
-                if 'taxid' in str(col).lower() and 'interactor' in str(col).lower():
-                    taxid_cols.append(i)
-            
-            # If we found taxid columns
-            if len(taxid_cols) >= 2:
-                # Keep only rows where both interactors are human (taxid 9606)
-                human_mask = df.iloc[:, taxid_cols].apply(
-                    lambda x: all('9606' in str(val).lower() or 'human' in str(val).lower() for val in x),
-                    axis=1
-                )
-                df = df[human_mask]
-            
-            # Identify alias/gene name columns
-            alias_cols = []
-            for i, col in enumerate(df.columns):
-                if 'alias' in str(col).lower() and 'interactor' in str(col).lower():
-                    alias_cols.append(i)
-            
-            if len(alias_cols) < 2:
-                print("Could not find alias columns in IntAct data")
-                return create_test_ppi_network("IntACT")
-            
-            # Extract gene symbols from aliases
-            def extract_gene_symbol(aliases):
-                if not isinstance(aliases, str):
-                    return None
-                
-                try:
-                    for alias in aliases.split('|'):
-                        if 'gene name:' in alias.lower():
-                            # Extract the gene name
-                            name = alias.split('gene name:')[1].split('(')[0].strip()
-                            return name
-                except:
-                    return None
+        # Extract gene symbols from aliases
+        def extract_gene_symbol(aliases):
+            if not isinstance(aliases, str):
                 return None
             
-            # Apply gene symbol extraction to alias columns
-            df['gene_a'] = df.iloc[:, alias_cols[0]].apply(extract_gene_symbol)
-            df['gene_b'] = df.iloc[:, alias_cols[1]].apply(extract_gene_symbol)
+            try:
+                for alias in aliases.split('|'):
+                    if 'gene name' in alias.lower():
+                        # Extract the gene name
+                        name = alias.split('uniprotkb:')[1].split('(gene name)')[0].strip()
+                        return name
+            except:
+                return None
+            return None
+
+        # Process file in chunks to reduce memory usage
+        chunk_size = 100000  # Adjust based on available memory
+        edges_added = 0
+        total_lines = 0
+        human_interactions = 0
+        
+        print("Processing IntAct file in chunks...")
+        with open(intact_file, 'r') as f:
+            # Skip header if present
+            if column_names:
+                next(f)
             
-            # Filter out interactions where gene symbols couldn't be extracted
-            df = df.dropna(subset=['gene_a', 'gene_b'])
-            
-            # Extract confidence scores if available
-            conf_col = None
-            for i, col in enumerate(df.columns):
-                if 'confidence' in str(col).lower() and 'value' in str(col).lower():
-                    conf_col = i
-                    break
-            
-            if conf_col is not None:
-                def extract_confidence(conf_str):
-                    try:
-                        if isinstance(conf_str, str) and 'intact-miscore:' in conf_str:
-                            return float(conf_str.split('intact-miscore:')[1])
-                        return 0.5  # default confidence
-                    except:
-                        return 0.5
+            chunk = []
+            for i, line in enumerate(tqdm(f, desc="Reading IntAct data")):
+                total_lines += 1
                 
-                df['confidence'] = df.iloc[:, conf_col].apply(extract_confidence)
-            else:
-                df['confidence'] = 0.5  # default confidence
+                # Process in chunks
+                chunk.append(line)
+                if len(chunk) >= chunk_size:
+                    edges_added += process_intact_chunk(chunk, G, taxid_col_indices, 
+                                                       alias_col_indices, confidence_col_index, 
+                                                       extract_gene_symbol)
+                    human_interactions += len(chunk)
+                    chunk = []
             
-            # Create a graph
-            G = nx.Graph()
+            # Process the final chunk
+            if chunk:
+                edges_added += process_intact_chunk(chunk, G, taxid_col_indices, 
+                                                   alias_col_indices, confidence_col_index, 
+                                                   extract_gene_symbol)
+                human_interactions += len(chunk)
+        
+        # Create a mapping of gene symbols to node IDs (in this case, they're the same)
+        gene_map = {gene: gene for gene in G.nodes()}
+        
+        print(f"Processed {total_lines} total interactions")
+        print(f"Found {human_interactions} human interactions")
+        print(f"IntAct network loaded with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+        
+        return G, gene_map
             
-            # Add edges to the graph
-            for _, row in df.iterrows():
-                G.add_edge(row['gene_a'], row['gene_b'], weight=row['confidence'])
-            
-            # Create a mapping of gene symbols to node IDs (in this case, they're the same)
-            gene_map = {gene: gene for gene in G.nodes()}
-            
-            print(f"IntAct network loaded with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
-            
-            return G, gene_map
-            
-        except Exception as e:
-            print(f"Error processing IntAct data: {str(e)}")
-            return create_test_ppi_network("IntACT")
+    except Exception as e:
+        print(f"Error processing IntAct data: {str(e)}")
+        return create_test_ppi_network("IntACT")
     
     finally:
         # Clean up temporary files
         safe_rmdir(temp_dir)
+
+
+def process_intact_chunk(chunk, G, taxid_col_indices, alias_col_indices, confidence_col_index, extract_gene_symbol):
+    """
+    Process a chunk of IntAct data and add edges to the graph
+    
+    Parameters:
+    -----------
+    chunk : list
+        List of lines from the IntAct file
+    G : networkx.Graph
+        Graph to add edges to
+    taxid_col_indices : list
+        Indices of the taxid columns
+    alias_col_indices : list
+        Indices of the alias columns
+    confidence_col_index : int or None
+        Index of the confidence column, or None if not available
+    extract_gene_symbol : function
+        Function to extract gene symbols from aliases
+        
+    Returns:
+    --------
+    int
+        Number of edges added to the graph
+    """
+    edges_added = 0
+    
+    for line in chunk:
+        try:
+            # Split the line by tabs
+            parts = line.strip().split('\t')
+            
+            # Skip if not enough columns
+            if len(parts) <= max(max(taxid_col_indices), max(alias_col_indices)):
+                continue
+            
+            # Check if both interactors are human
+            is_human = True
+            for idx in taxid_col_indices:
+                if idx < len(parts):
+                    taxid = parts[idx].lower()
+                    if '9606' not in taxid and 'human' not in taxid:
+                        is_human = False
+                        break
+            
+            if not is_human:
+                continue
+            
+            # Extract gene symbols
+            gene_a = extract_gene_symbol(parts[alias_col_indices[0]])
+            gene_b = extract_gene_symbol(parts[alias_col_indices[1]])
+            
+            # Skip if gene symbols couldn't be extracted
+            if not gene_a or not gene_b:
+                continue
+            
+            # Extract confidence score if available
+            confidence = 0.5  # default
+            if confidence_col_index is not None and confidence_col_index < len(parts):
+                conf_str = parts[confidence_col_index]
+                try:
+                    if 'intact-miscore:' in conf_str:
+                        confidence = float(conf_str.split('intact-miscore:')[1])
+                except:
+                    pass
+            
+            # Add edge to graph
+            G.add_edge(gene_a, gene_b, weight=confidence)
+            edges_added += 1
+            
+        except Exception as e:
+            # Skip problematic lines
+            continue
+    
+    return edges_added
 
 
 def load_custom_ppi():
@@ -487,38 +550,24 @@ def load_custom_ppi():
     print("Please upload a CSV file with columns: 'gene_a', 'gene_b', and optionally 'weight'")
     
     try:
-        from google.colab import files
-        uploaded = files.upload()
-        
-        if not uploaded:
-            print("No file uploaded. Creating test network.")
-            return create_test_ppi_network("Custom")
-        
-        filename = list(uploaded.keys())[0]
-        
-        # Read the uploaded CSV file
-        df = pd.read_csv(io.BytesIO(uploaded[filename]))
-        
-        # Check if required columns exist
-        required_cols = ['gene_a', 'gene_b']
-        if not all(col in df.columns for col in required_cols):
-            print(f"CSV must contain columns: {', '.join(required_cols)}")
-            return create_test_ppi_network("Custom")
-        
-        # Create a graph
+        readpath = '/content/drive/My Drive/networks of pain/'
+        # Read input files
+        ppi = pd.read_csv(readpath + '/ppi_data/PPI_direct_elist.csv', header=None)
+        # these are annotated by https://www.syngoportal.org/convert
+        alist = pd.read_csv(readpath + '/ppi_data/entrez_A.csv')
+        blist = pd.read_csv(readpath + '/ppi_data/entrez_B.csv')
+
+        # first we will substitute the ppi network entrez id's with the actual gene names
+        ppi.columns = ['entrez_A','entrez_B']
+        alist.rename(columns={'entrezgene':'entrez_A', 'symbol':"Gene_A_symbol"},inplace=True)
+        blist.rename(columns={'entrezgene':'entrez_B', 'symbol':"Gene_B_symbol"},inplace=True)
+
+
+        ppi = ppi.merge(alist[['entrez_A', 'Gene_A_symbol']], how='left', on='entrez_A')
+        ppi = ppi.merge(blist[['entrez_B', 'Gene_B_symbol']], how='left',on='entrez_B')
+        protein_pairs = ppi[['Gene_A_symbol', 'Gene_B_symbol']].values.tolist()
         G = nx.Graph()
-        
-        # Add edges to the graph
-        if 'weight' in df.columns:
-            for _, row in df.iterrows():
-                try:
-                    weight = float(row['weight'])
-                    G.add_edge(row['gene_a'], row['gene_b'], weight=weight)
-                except:
-                    G.add_edge(row['gene_a'], row['gene_b'], weight=1.0)
-        else:
-            for _, row in df.iterrows():
-                G.add_edge(row['gene_a'], row['gene_b'], weight=1.0)
+        G.add_edges_from(protein_pairs)
         
         # Create a mapping of gene symbols to node IDs (in this case, they're the same)
         gene_map = {gene: gene for gene in G.nodes()}
@@ -619,7 +668,7 @@ def load_string():
         except Exception as e:
             print(f"Error processing STRING mapping: {str(e)}")
             return create_test_ppi_network("STRING")
-        
+
         # Filter for medium-high confidence interactions (score >= 700)
         try:
             df['combined_score'] = pd.to_numeric(df['combined_score'], errors='coerce')
@@ -627,7 +676,7 @@ def load_string():
         except:
             # If conversion fails, try to keep going
             pass
-        
+      
         # Create a graph
         G = nx.Graph()
         
@@ -635,19 +684,19 @@ def load_string():
         for _, row in df.iterrows():
             try:
                 # Extract protein IDs - handling different formats
-                p1 = str(row['protein1'])
-                p2 = str(row['protein2'])
+                protein_a = str(row['protein1'])
+                protein_b = str(row['protein2'])
                 
-                # Get just the protein ID part (remove species prefix if present)
-                if '.' in p1:
-                    protein_a = p1.split('.')[1]
-                else:
-                    protein_a = p1
+                # # Get just the protein ID part (remove species prefix if present)
+                # if '.' in p1:
+                #     protein_a = p1.split('.')[1]
+                # else:
+                #     protein_a = p1
                     
-                if '.' in p2:
-                    protein_b = p2.split('.')[1]
-                else:
-                    protein_b = p2
+                # if '.' in p2:
+                #     protein_b = p2.split('.')[1]
+                # else:
+                #     protein_b = p2
                 
                 # Map to gene symbols
                 gene_a = protein_to_gene.get(protein_a)
@@ -675,10 +724,10 @@ def load_string():
         # Clean up temporary files
         safe_rmdir(temp_dir)
 
-
 def load_huri():
     """
     Load the Human Reference Interactome (HuRI) network
+    With translation from ENSEMBL IDs to gene names
     
     Returns:
     --------
@@ -704,66 +753,93 @@ def load_huri():
             print("Failed to download HuRI data")
             return create_test_ppi_network("HuRI")
         
-        # Determine the file format by reading the first few lines
+        # Check file format and load data
         try:
-            with open(temp_path, 'r') as f:
-                first_line = f.readline().strip()
-                second_line = f.readline().strip() if first_line else ""
+            # Read the file
+            df = pd.read_csv(temp_path, sep='\t')
             
-            # Check if first line looks like a header
-            is_header_line = False
-            if first_line and any(keyword in first_line.lower() for keyword in ['gene', 'protein', 'symbol', 'id']):
-                is_header_line = True
+            # Detect if we have ENSEMBL IDs (starting with ENSG)
+            columns = df.columns.tolist()
+            ensembl_format = any('ENSG' in col for col in columns)
             
-            # Read the TSV file
-            if is_header_line:
-                df = pd.read_csv(temp_path, sep='\t')
-            else:
-                df = pd.read_csv(temp_path, sep='\t', header=None)
-                # Assign default column names
-                if df.shape[1] >= 2:
-                    df.columns = ['Gene_A', 'Gene_B'] + [f'Col{i}' for i in range(2, df.shape[1])]
-            
-            # Look for gene name columns
-            gene_a_col = None
-            gene_b_col = None
-            
-            for col in df.columns:
-                col_str = str(col).lower()
-                if ('gene' in col_str or 'symbol' in col_str) and ('a' in col_str or '1' in col_str or 'first' in col_str):
-                    gene_a_col = col
-                elif ('gene' in col_str or 'symbol' in col_str) and ('b' in col_str or '2' in col_str or 'second' in col_str):
-                    gene_b_col = col
-            
-            # If standard naming failed, assume first two columns are gene IDs
-            if gene_a_col is None or gene_b_col is None:
-                if df.shape[1] >= 2:
-                    gene_a_col = df.columns[0]
-                    gene_b_col = df.columns[1]
-                else:
-                    print("HuRI data does not have enough columns")
+            if ensembl_format:
+                print("Detected ENSEMBL IDs in HuRI data. Will translate to gene names.")
+                
+                # Download ENSEMBL to gene name mapping
+                ensembl_map = download_ensembl_mapping(temp_dir)
+                
+                if not ensembl_map:
+                    print("Failed to create ENSEMBL to gene name mapping. Using test network.")
                     return create_test_ppi_network("HuRI")
-            
+                
+                # Convert columns to proper gene symbols
+                gene_a_col = columns[0]
+                gene_b_col = columns[1]
+                
+                # Create a graph with translated gene names
+                G = nx.Graph()
+                
+                # Track ENSEMBL IDs that couldn't be mapped
+                unmapped_ids = set()
+                
+                # Add edges to the graph
+                for _, row in tqdm(df.iterrows(), desc="Processing HuRI interactions", total=len(df)):
+                    ensembl_a = str(row[gene_a_col]).strip()
+                    ensembl_b = str(row[gene_b_col]).strip()
+                    
+                    # Skip if not valid ENSEMBL IDs
+                    if not ensembl_a.startswith('ENSG') or not ensembl_b.startswith('ENSG'):
+                        continue
+                    
+                    # Translate ENSEMBL IDs to gene names
+                    gene_a = ensembl_map.get(ensembl_a)
+                    gene_b = ensembl_map.get(ensembl_b)
+                    
+                    # Track unmapped IDs
+                    if not gene_a:
+                        unmapped_ids.add(ensembl_a)
+                    if not gene_b:
+                        unmapped_ids.add(ensembl_b)
+                    
+                    # Skip if either gene couldn't be mapped
+                    if not gene_a or not gene_b:
+                        continue
+                    
+                    # Add edge to graph
+                    G.add_edge(gene_a, gene_b, weight=1.0)
+                
+                if unmapped_ids:
+                    print(f"Warning: {len(unmapped_ids)} ENSEMBL IDs couldn't be mapped to gene names")
+                    # Save unmapped IDs for reference
+                    with open(os.path.join(temp_dir, "unmapped_ensembl.txt"), 'w') as f:
+                        for id in unmapped_ids:
+                            f.write(f"{id}\n")
+            else:
+                # Process as normal (non-ENSEMBL format)
+                # Identify gene name columns
+                gene_a_col = columns[0]
+                gene_b_col = columns[1]
+                
+                # Create a graph
+                G = nx.Graph()
+                
+                # Add edges to the graph
+                for _, row in df.iterrows():
+                    try:
+                        gene_a = str(row[gene_a_col]).strip()
+                        gene_b = str(row[gene_b_col]).strip()
+                        
+                        # Skip if not valid gene symbols
+                        if not gene_a or not gene_b or gene_a == 'nan' or gene_b == 'nan':
+                            continue
+                            
+                        G.add_edge(gene_a, gene_b, weight=1.0)
+                    except:
+                        continue
+        
         except Exception as e:
             print(f"Error reading HuRI data: {str(e)}")
             return create_test_ppi_network("HuRI")
-        
-        # Create a graph
-        G = nx.Graph()
-        
-        # Add edges to the graph
-        for _, row in df.iterrows():
-            try:
-                gene_a = str(row[gene_a_col]).strip()
-                gene_b = str(row[gene_b_col]).strip()
-                
-                # Skip if not valid gene symbols
-                if not gene_a or not gene_b or gene_a == 'nan' or gene_b == 'nan':
-                    continue
-                    
-                G.add_edge(gene_a, gene_b, weight=1.0)  # Default weight of 1.0
-            except:
-                continue
         
         # Create a mapping of gene symbols to node IDs (in this case, they're the same)
         gene_map = {gene: gene for gene in G.nodes()}
@@ -775,6 +851,50 @@ def load_huri():
     finally:
         # Clean up temporary files
         safe_rmdir(temp_dir)
+
+
+def download_ensembl_mapping(temp_dir):
+    """
+    Download and create ENSEMBL ID to gene name mapping
+    
+    Parameters:
+    -----------
+    temp_dir : str
+        Directory to store temporary files
+        
+    Returns:
+    --------
+    dict
+        Mapping from ENSEMBL IDs to gene names
+    """
+    print("Downloading ENSEMBL to gene name mapping...")
+    
+    # Try multiple approaches to get the mapping
+    
+    # Approach 1: biomart - direct download (most reliable but might be slow)
+    try:
+        # URL for human gene mapping from Ensembl BioMart
+        biomart_url = "http://www.ensembl.org/biomart/martservice?query=<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE Query><Query virtualSchemaName=\"default\" formatter=\"TSV\" header=\"1\" uniqueRows=\"1\" count=\"\" datasetConfigVersion=\"0.6\"><Dataset name=\"hsapiens_gene_ensembl\" interface=\"default\"><Attribute name=\"ensembl_gene_id\"/><Attribute name=\"external_gene_name\"/></Dataset></Query>"
+        
+        # Download the data
+        mapping_path = os.path.join(temp_dir, "ensembl_mapping.tsv")
+        download_file(biomart_url, mapping_path)
+        
+        if os.path.exists(mapping_path) and os.path.getsize(mapping_path) > 0:
+            # Read the mapping file
+            mapping_df = pd.read_csv(mapping_path, sep='\t')
+            
+            # Create a dictionary mapping ENSEMBL IDs to gene names
+            ensembl_map = {}
+            for _, row in mapping_df.iterrows():
+                if pd.notna(row[0]) and pd.notna(row[1]):
+                    ensembl_map[row[0]] = row[1]
+            
+            if ensembl_map:
+                #print(f"Downloaded mapping for {len(ensembl_map)} ENSEMBL IDs")
+                return ensembl_map
+    except Exception as e:
+        print(f"Error downloading from BioMart: {str(e)}")
 
 
 def load_bioplex():
@@ -931,7 +1051,7 @@ def load_biogrid():
             # Find the human interactions file
             human_file = None
             for file in os.listdir(temp_dir):
-                if "HUMAN" in file and file.endswith(".tab2.txt"):
+                if "Homo_sapiens" in file and file.endswith(".tab2.txt"):
                     human_file = os.path.join(temp_dir, file)
                     break
             
@@ -957,8 +1077,8 @@ def load_biogrid():
             # Process column names to find what we need
             gene_a_col = None
             gene_b_col = None
-            species_a_col = None
-            species_b_col = None
+            # species_a_col = None
+            # species_b_col = None
             exp_system_col = None
             
             for col in df.columns:
@@ -967,10 +1087,10 @@ def load_biogrid():
                     gene_a_col = col
                 elif 'symbol' in col_str and ('b' in col_str or 'interactor b' in col_str):
                     gene_b_col = col
-                elif 'organism' in col_str and ('a' in col_str or 'interactor a' in col_str):
-                    species_a_col = col
-                elif 'organism' in col_str and ('b' in col_str or 'interactor b' in col_str):
-                    species_b_col = col
+                # elif 'organism' in col_str and ('a' in col_str or 'interactor a' in col_str):
+                #     species_a_col = col
+                # elif 'organism' in col_str and ('b' in col_str or 'interactor b' in col_str):
+                #     species_b_col = col
                 elif 'experimental' in col_str and 'system' in col_str:
                     exp_system_col = col
             
@@ -978,9 +1098,9 @@ def load_biogrid():
             if gene_a_col is None or gene_b_col is None:
                 for col in df.columns:
                     col_str = str(col).lower()
-                    if ('official' in col_str or 'gene' in col_str) and ('a' in col_str or '1' in col_str):
+                    if ('official symbol interactor a' in col_str or 'gene' in col_str) and ('a' in col_str or '1' in col_str):
                         gene_a_col = col
-                    elif ('official' in col_str or 'gene' in col_str) and ('b' in col_str or '2' in col_str):
+                    elif ('official symbol interactor b' in col_str or 'gene' in col_str) and ('b' in col_str or '2' in col_str):
                         gene_b_col = col
             
             # If we still can't find them, use positional columns
@@ -988,11 +1108,11 @@ def load_biogrid():
                 print("Could not identify gene columns in BioGRID data")
                 return create_test_ppi_network("Biogrid")
             
-            # Filter for human interactions if species columns are available
-            if species_a_col and species_b_col:
-                human_mask = df[species_a_col].str.contains('sapiens|human', case=False, na=False) & \
-                             df[species_b_col].str.contains('sapiens|human', case=False, na=False)
-                df = df[human_mask]
+            # # Filter for human interactions if species columns are available
+            # if species_a_col and species_b_col:
+            #     human_mask = df[species_a_col].str.contains('sapiens|homo', case=False, na=False) & \
+            #                  df[species_b_col].str.contains('sapiens|homo', case=False, na=False)
+            #     df = df[human_mask]
                 
         except Exception as e:
             print(f"Error reading BioGRID data: {str(e)}")
@@ -1043,368 +1163,3 @@ def load_biogrid():
     finally:
         # Clean up temporary files
         safe_rmdir(temp_dir)
-
-
-def load_happi():
-    """
-    Load the Human Annotated and Predicted Protein Interactions (HAPPI) network
-    
-    Returns:
-    --------
-    networkx.Graph
-        The HAPPI network
-    dict
-        Mapping of gene symbols to node identifiers
-    """
-    print("Loading HAPPI PPI network...")
-    
-    # HAPPI requires registration and API key, so we'll simulate access via a custom upload
-    print("HAPPI database requires registration. Please upload a HAPPI network file with columns:")
-    print("'gene_a', 'gene_b', 'confidence' (optional)")
-    
-    try:
-        from google.colab import files
-        uploaded = files.upload()
-        
-        if not uploaded:
-            print("No file uploaded. Creating test network.")
-            return create_test_ppi_network("HAPPI")
-        
-        filename = list(uploaded.keys())[0]
-        
-        # Read the uploaded CSV file
-        df = pd.read_csv(io.BytesIO(uploaded[filename]))
-        
-        # Check if required columns exist
-        required_cols = ['gene_a', 'gene_b']
-        if not all(col in df.columns for col in required_cols):
-            print(f"CSV must contain columns: {', '.join(required_cols)}")
-            return create_test_ppi_network("HAPPI")
-        
-        # Create a graph
-        G = nx.Graph()
-        
-        # Add edges to the graph
-        for _, row in df.iterrows():
-            try:
-                gene_a = str(row['gene_a']).strip()
-                gene_b = str(row['gene_b']).strip()
-                
-                # Skip if not valid gene symbols
-                if not gene_a or not gene_b or gene_a == 'nan' or gene_b == 'nan':
-                    continue
-                    
-                if 'confidence' in df.columns and pd.notna(row['confidence']):
-                    try:
-                        confidence = float(row['confidence'])
-                    except:
-                        confidence = 1.0
-                else:
-                    confidence = 1.0
-                    
-                G.add_edge(gene_a, gene_b, weight=confidence)
-            except:
-                continue
-        
-        # Create a mapping of gene symbols to node IDs (in this case, they're the same)
-        gene_map = {gene: gene for gene in G.nodes()}
-        
-        print(f"HAPPI network loaded with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
-        
-        return G, gene_map
-    
-    except Exception as e:
-        print(f"Error loading HAPPI network: {str(e)}")
-        return create_test_ppi_network("HAPPI")
-
-
-def load_dics():
-    """
-    Load the Database of Interacting Cytokines and Signals (DICS) network
-    
-    Returns:
-    --------
-    networkx.Graph
-        The DICS network
-    dict
-        Mapping of gene symbols to node identifiers
-    """
-    print("Loading DICS PPI network...")
-    
-    # DICS might not have a direct download URL, so we'll simulate access via a custom upload
-    print("Please upload a DICS network file with columns:")
-    print("'gene_a', 'gene_b', 'confidence' (optional)")
-    
-    try:
-        from google.colab import files
-        uploaded = files.upload()
-        
-        if not uploaded:
-            print("No file uploaded. Creating test network.")
-            return create_test_ppi_network("DICS")
-        
-        filename = list(uploaded.keys())[0]
-        
-        # Read the uploaded CSV file
-        df = pd.read_csv(io.BytesIO(uploaded[filename]))
-        
-        # Check if required columns exist
-        required_cols = ['gene_a', 'gene_b']
-        if not all(col in df.columns for col in required_cols):
-            print(f"CSV must contain columns: {', '.join(required_cols)}")
-            return create_test_ppi_network("DICS")
-        
-        # Create a graph
-        G = nx.Graph()
-        
-        # Add edges to the graph
-        for _, row in df.iterrows():
-            try:
-                gene_a = str(row['gene_a']).strip()
-                gene_b = str(row['gene_b']).strip()
-                
-                # Skip if not valid gene symbols
-                if not gene_a or not gene_b or gene_a == 'nan' or gene_b == 'nan':
-                    continue
-                    
-                if 'confidence' in df.columns and pd.notna(row['confidence']):
-                    try:
-                        confidence = float(row['confidence'])
-                    except:
-                        confidence = 1.0
-                else:
-                    confidence = 1.0
-                    
-                G.add_edge(gene_a, gene_b, weight=confidence)
-            except:
-                continue
-        
-        # Create a mapping of gene symbols to node IDs (in this case, they're the same)
-        gene_map = {gene: gene for gene in G.nodes()}
-        
-        print(f"DICS network loaded with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
-        
-        return G, gene_map
-    
-    except Exception as e:
-        print(f"Error loading DICS network: {str(e)}")
-        return create_test_ppi_network("DICS")
-
-
-def load_intnetdb():
-    """
-    Load the Integrated Network Database (IntNetDB) network
-    
-    Returns:
-    --------
-    networkx.Graph
-        The IntNetDB network
-    dict
-        Mapping of gene symbols to node identifiers
-    """
-    print("Loading IntNetDB PPI network...")
-    
-    # IntNetDB might not have a direct download URL, so we'll simulate access via a custom upload
-    print("Please upload an IntNetDB network file with columns:")
-    print("'gene_a', 'gene_b', 'confidence' (optional)")
-    
-    try:
-        from google.colab import files
-        uploaded = files.upload()
-        
-        if not uploaded:
-            print("No file uploaded. Creating test network.")
-            return create_test_ppi_network("IntNetDB")
-        
-        filename = list(uploaded.keys())[0]
-        
-        # Read the uploaded CSV file
-        df = pd.read_csv(io.BytesIO(uploaded[filename]))
-        
-        # Check if required columns exist
-        required_cols = ['gene_a', 'gene_b']
-        if not all(col in df.columns for col in required_cols):
-            print(f"CSV must contain columns: {', '.join(required_cols)}")
-            return create_test_ppi_network("IntNetDB")
-        
-        # Create a graph
-        G = nx.Graph()
-        
-        # Add edges to the graph
-        for _, row in df.iterrows():
-            try:
-                gene_a = str(row['gene_a']).strip()
-                gene_b = str(row['gene_b']).strip()
-                
-                # Skip if not valid gene symbols
-                if not gene_a or not gene_b or gene_a == 'nan' or gene_b == 'nan':
-                    continue
-                    
-                if 'confidence' in df.columns and pd.notna(row['confidence']):
-                    try:
-                        confidence = float(row['confidence'])
-                    except:
-                        confidence = 1.0
-                else:
-                    confidence = 1.0
-                    
-                G.add_edge(gene_a, gene_b, weight=confidence)
-            except:
-                continue
-        
-        # Create a mapping of gene symbols to node IDs (in this case, they're the same)
-        gene_map = {gene: gene for gene in G.nodes()}
-        
-        print(f"IntNetDB network loaded with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
-        
-        return G, gene_map
-    
-    except Exception as e:
-        print(f"Error loading IntNetDB network: {str(e)}")
-        return create_test_ppi_network("IntNetDB")
-
-
-def load_imitatedb():
-    """
-    Load the ImitateDB network
-    
-    Returns:
-    --------
-    networkx.Graph
-        The ImitateDB network
-    dict
-        Mapping of gene symbols to node identifiers
-    """
-    print("Loading ImitateDB PPI network...")
-    
-    # ImitateDB might not have a direct download URL, so we'll simulate access via a custom upload
-    print("Please upload an ImitateDB network file with columns:")
-    print("'gene_a', 'gene_b', 'confidence' (optional)")
-    
-    try:
-        from google.colab import files
-        uploaded = files.upload()
-        
-        if not uploaded:
-            print("No file uploaded. Creating test network.")
-            return create_test_ppi_network("ImitateDB")
-        
-        filename = list(uploaded.keys())[0]
-        
-        # Read the uploaded CSV file
-        df = pd.read_csv(io.BytesIO(uploaded[filename]))
-        
-        # Check if required columns exist
-        required_cols = ['gene_a', 'gene_b']
-        if not all(col in df.columns for col in required_cols):
-            print(f"CSV must contain columns: {', '.join(required_cols)}")
-            return create_test_ppi_network("ImitateDB")
-        
-        # Create a graph
-        G = nx.Graph()
-        
-        # Add edges to the graph
-        for _, row in df.iterrows():
-            try:
-                gene_a = str(row['gene_a']).strip()
-                gene_b = str(row['gene_b']).strip()
-                
-                # Skip if not valid gene symbols
-                if not gene_a or not gene_b or gene_a == 'nan' or gene_b == 'nan':
-                    continue
-                    
-                if 'confidence' in df.columns and pd.notna(row['confidence']):
-                    try:
-                        confidence = float(row['confidence'])
-                    except:
-                        confidence = 1.0
-                else:
-                    confidence = 1.0
-                    
-                G.add_edge(gene_a, gene_b, weight=confidence)
-            except:
-                continue
-        
-        # Create a mapping of gene symbols to node IDs (in this case, they're the same)
-        gene_map = {gene: gene for gene in G.nodes()}
-        
-        print(f"ImitateDB network loaded with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
-        
-        return G, gene_map
-    
-    except Exception as e:
-        print(f"Error loading ImitateDB network: {str(e)}")
-        return create_test_ppi_network("ImitateDB")
-
-
-def load_dlip():
-    """
-    Load the DLIP (Deep Learning-based Protein Interaction Prediction) network
-    
-    Returns:
-    --------
-    networkx.Graph
-        The DLIP network
-    dict
-        Mapping of gene symbols to node identifiers
-    """
-    print("Loading DLIP PPI network...")
-    
-    # DLIP might not have a direct download URL, so we'll simulate access via a custom upload
-    print("Please upload a DLIP network file with columns:")
-    print("'gene_a', 'gene_b', 'confidence' (optional)")
-    
-    try:
-        from google.colab import files
-        uploaded = files.upload()
-        
-        if not uploaded:
-            print("No file uploaded. Creating test network.")
-            return create_test_ppi_network("DLIP")
-        
-        filename = list(uploaded.keys())[0]
-        
-        # Read the uploaded CSV file
-        df = pd.read_csv(io.BytesIO(uploaded[filename]))
-        
-        # Check if required columns exist
-        required_cols = ['gene_a', 'gene_b']
-        if not all(col in df.columns for col in required_cols):
-            print(f"CSV must contain columns: {', '.join(required_cols)}")
-            return create_test_ppi_network("DLIP")
-        
-        # Create a graph
-        G = nx.Graph()
-        
-        # Add edges to the graph
-        for _, row in df.iterrows():
-            try:
-                gene_a = str(row['gene_a']).strip()
-                gene_b = str(row['gene_b']).strip()
-                
-                # Skip if not valid gene symbols
-                if not gene_a or not gene_b or gene_a == 'nan' or gene_b == 'nan':
-                    continue
-                    
-                if 'confidence' in df.columns and pd.notna(row['confidence']):
-                    try:
-                        confidence = float(row['confidence'])
-                    except:
-                        confidence = 1.0
-                else:
-                    confidence = 1.0
-                    
-                G.add_edge(gene_a, gene_b, weight=confidence)
-            except:
-                continue
-        
-        # Create a mapping of gene symbols to node IDs (in this case, they're the same)
-        gene_map = {gene: gene for gene in G.nodes()}
-        
-        print(f"DLIP network loaded with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
-        
-        return G, gene_map
-    
-    except Exception as e:
-        print(f"Error loading DLIP network: {str(e)}")
-        return create_test_ppi_network("DLIP")
